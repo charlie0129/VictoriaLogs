@@ -22,6 +22,10 @@ var (
 	maxUnpackedBlockSize = flagutil.NewBytes("remoteWrite.maxBlockSize", 8*1024*1024, "The maximum block size to send to remote storage. Bigger blocks may improve performance at the cost of the increased memory usage.")
 	flushInterval        = flag.Duration("remoteWrite.flushInterval", time.Second, "Interval for flushing the data to remote storage. "+
 		"This option takes effect only when less than 2MB of data per second are pushed to -remoteWrite.url")
+	compressionLevel = flag.Int("remoteWrite.compressionLevel", 1, "The zstd compression level for remote write blocks. "+
+		"This is only useful if remoteWrite.maxBlockSize and remoteWrite.flushInterval is sufficiently large to benefit from compression. "+
+		"Higher compression levels may improve compression ratio at the cost of greatly increased CPU usage. "+
+		"Valid values are from 1 (fastest) to 22 (best compression).")
 )
 
 type pendingLogs struct {
@@ -134,7 +138,7 @@ func (wr *writeRequest) push(pushBlock func([]byte)) {
 	b := wr.pendingData.B
 
 	zb := compressBufPool.Get()
-	zb.B = zstd.CompressLevel(zb.B[:0], b, 1)
+	zb.B = zstd.CompressLevel(zb.B[:0], b, *compressionLevel)
 	zbLen := len(zb.B)
 	pushBlock(zb.B)
 	compressBufPool.Put(zb)
