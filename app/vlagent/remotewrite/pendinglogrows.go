@@ -25,7 +25,7 @@ var (
 	compressionLevel = flag.Int("remoteWrite.compressionLevel", 1, "The zstd compression level for remote write blocks. "+
 		"This is only useful if remoteWrite.maxBlockSize and remoteWrite.flushInterval is sufficiently large to benefit from compression. "+
 		"Higher compression levels may improve compression ratio at the cost of greatly increased CPU usage. "+
-		"Valid values are from 1 (fastest) to 22 (best compression).")
+		"Valid values are from -22 (fastest) to 22 (best compression).")
 )
 
 type pendingLogs struct {
