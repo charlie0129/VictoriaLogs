@@ -84,6 +84,9 @@ type datadb struct {
 	// flushInterval is interval for flushing the inmemory parts to disk
 	flushInterval time.Duration
 
+	// readOnly indicates whether the database is opened in read-only mode.
+	readOnly bool
+
 	// inmemoryParts contains a list of inmemory parts
 	inmemoryParts []*partWrapper
 
@@ -167,9 +170,13 @@ func mustCreateDatadb(path string) {
 }
 
 // mustOpenDatadb opens datadb at the given path with the given flushInterval for in-memory data.
-func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *datadb {
-	partNames := mustReadPartNames(path)
-	mustRemoveUnusedDirs(path, partNames)
+func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration, readOnly bool) *datadb {
+	partNames := mustReadPartNames(path, readOnly)
+	if readOnly {
+		warnAboutUnusedDirs(path, partNames)
+	} else {
+		mustRemoveUnusedDirs(path, partNames)
+	}
 
 	var smallParts []*partWrapper
 	var bigParts []*partWrapper
@@ -197,6 +204,7 @@ func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *da
 	ddb := &datadb{
 		pt:            pt,
 		flushInterval: flushInterval,
+		readOnly:      readOnly,
 
 		inmemoryPartMergeDuration: metrics.GetOrCreateSummary(`vl_merge_duration_seconds{type="storage/inmemory"}`),
 		inmemoryPartMergeBytes:    metrics.GetOrCreateSummary(`vl_merge_bytes{type="storage/inmemory"}`),
@@ -213,7 +221,9 @@ func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *da
 	ddb.rb.init(&ddb.wg, ddb.mustFlushLogRows)
 	ddb.mergeIdx.Store(uint64(time.Now().UnixNano()))
 
-	ddb.startBackgroundWorkers()
+	if !readOnly {
+		ddb.startBackgroundWorkers()
+	}
 
 	return ddb
 }
@@ -1227,6 +1237,31 @@ func needStop(stopCh <-chan struct{}) bool {
 
 // mustCloseDatadb can be called only when nobody accesses ddb.
 func mustCloseDatadb(ddb *datadb) {
+	if ddb.readOnly {
+		// Do not flush or merge anything when opened in read-only mode.
+		close(ddb.stopCh)
+
+		for _, pw := range ddb.smallParts {
+			pw.decRef()
+			if n := pw.refCount.Load(); n != 0 {
+				logger.Panicf("BUG: there are %d references to smallPart", n)
+			}
+		}
+		ddb.smallParts = nil
+
+		for _, pw := range ddb.bigParts {
+			pw.decRef()
+			if n := pw.refCount.Load(); n != 0 {
+				logger.Panicf("BUG: there are %d references to bigPart", n)
+			}
+		}
+		ddb.bigParts = nil
+
+		ddb.path = ""
+		ddb.pt = nil
+		return
+	}
+
 	// Flush ddb.rb for the last time
 	ddb.rb.flush()
 
@@ -1292,7 +1327,7 @@ func mustWritePartNames(path string, partNames []string) {
 	fs.MustWriteAtomic(partNamesPath, data, true)
 }
 
-func mustReadPartNames(path string) []string {
+func mustReadPartNames(path string, readOnly bool) []string {
 	partNamesPath := filepath.Join(path, partsFilename)
 	data, err := os.ReadFile(partNamesPath)
 	if err != nil {
@@ -1311,6 +1346,10 @@ func mustReadPartNames(path string) []string {
 			}
 
 			if len(partDirs) == 0 {
+				if readOnly {
+					logger.Warnf("missing %s with no part directories found in %s; continuing with empty parts list in read-only mode", partNamesPath, path)
+					return []string{}
+				}
 				logger.Warnf("creating missing %s with empty parts list, since no part directories found in %s", partNamesPath, path)
 				mustWritePartNames(path, nil)
 				return []string{}
@@ -1355,6 +1394,25 @@ func mustRemoveUnusedDirs(path string, partNames []string) {
 	}
 	if removedDirs > 0 {
 		fs.MustSyncPath(path)
+	}
+}
+
+func warnAboutUnusedDirs(path string, partNames []string) {
+	des := fs.MustReadDir(path)
+	m := make(map[string]struct{}, len(partNames))
+	for _, partName := range partNames {
+		m[partName] = struct{}{}
+	}
+	for _, de := range des {
+		if !fs.IsDirOrSymlink(de) {
+			// Skip non-directories.
+			continue
+		}
+		fn := de.Name()
+		if _, ok := m[fn]; !ok {
+			unusedPath := filepath.Join(path, fn)
+			logger.Warnf("leaving unused directory %s untouched in read-only mode, since it isn't listed in parts.json", unusedPath)
+		}
 	}
 }
 

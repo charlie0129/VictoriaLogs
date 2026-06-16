@@ -105,6 +105,7 @@ func mustOpenIndexdb(path, partitionName string, s *Storage) *indexdb {
 		s:             s,
 	}
 	var isReadOnly atomic.Bool
+	isReadOnly.Store(s.readOnly)
 	idb.tb = mergeset.MustOpenTable(path, s.flushInterval, idb.invalidateStreamFilterCache, mergeTagToStreamIDsRows, &isReadOnly)
 	return idb
 }

@@ -287,6 +287,8 @@ See the docs at https://docs.victoriametrics.com/victorialogs/
   -storage.minFreeDiskSpaceBytes size
      The minimum free disk space at -storageDataPath after which the storage stops accepting new data
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 10000000)
+  -storage.readOnly
+     Open -storageDataPath in read-only mode. In this mode VictoriaLogs doesn't create lock files, doesn't create or remove directories, doesn't run background merges, retention, delete tasks or snapshot cleanup, and rejects data writes. This mode is useful for querying read-only backups
   -storageDataPath string
      Path to directory where to store VictoriaLogs data; see https://docs.victoriametrics.com/victorialogs/#storage (default "victoria-logs-data")
   -storageNode array

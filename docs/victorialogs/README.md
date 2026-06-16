@@ -227,6 +227,8 @@ For example, the following command starts VictoriaLogs, which stores the data at
 VictoriaLogs automatically creates the `-storageDataPath` directory on the first run if it is missing. VictoriaLogs stores logs
 per every day into a separate subdirectory (aka per-day partition). See [partitions lifecycle](https://docs.victoriametrics.com/victorialogs/#partitions-lifecycle) for details.
 
+Pass `-storage.readOnly` when opening an existing `-storageDataPath` for querying only, such as a read-only backup. In this mode VictoriaLogs doesn't create the lock file, doesn't create or remove directories, doesn't run background merges, retention, delete tasks or snapshot cleanup, and rejects data writes.
+
 VictoriaLogs switches to cluster mode if `-storageNode` command-line flag is specified:
 
 - It stops storing the ingested logs locally in cluster mode. It spreads them evenly among `vlstorage` nodes specified via the `-storageNode` command-line flag.

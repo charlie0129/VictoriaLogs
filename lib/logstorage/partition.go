@@ -81,6 +81,10 @@ func mustOpenPartition(s *Storage, path string) *partition {
 	isDatadbExist := fs.IsPathExist(datadbPath)
 
 	if !isIndexDBExist {
+		if s.readOnly {
+			logger.Panicf("FATAL: cannot open partition %q in read-only mode, since indexdb directory %s is missing", path, indexdbPath)
+		}
+
 		if isDatadbExist {
 			logger.Panicf("FATAL: indexdb directory %s is missing, but datadb directory %s exists. "+
 				"This indicates corruption. Manually remove the %s partition to resolve it (partition data will be lost)",
@@ -103,12 +107,16 @@ func mustOpenPartition(s *Storage, path string) *partition {
 	}
 
 	if !isDatadbExist {
+		if s.readOnly {
+			logger.Panicf("FATAL: cannot open partition %q in read-only mode, since datadb directory %s is missing", path, datadbPath)
+		}
+
 		logger.Warnf("creating missing datadb directory %s, this could happen if VictoriaLogs shuts down uncleanly "+
 			"(via OOM crash, a panic, SIGKILL or hardware shutdown) while creating new per-day partition", datadbPath)
 		mustCreateDatadb(datadbPath)
 	}
 
-	pt.ddb = mustOpenDatadb(pt, datadbPath, s.flushInterval)
+	pt.ddb = mustOpenDatadb(pt, datadbPath, s.flushInterval, s.readOnly)
 
 	return pt
 }

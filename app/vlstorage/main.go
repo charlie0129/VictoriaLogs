@@ -45,6 +45,9 @@ var (
 		"See https://docs.victoriametrics.com/victorialogs/#how-to-remove-snapshots")
 	storageDataPath = flag.String("storageDataPath", "victoria-logs-data", "Path to directory where to store VictoriaLogs data; "+
 		"see https://docs.victoriametrics.com/victorialogs/#storage")
+	storageReadOnly = flag.Bool("storage.readOnly", false, "Open -storageDataPath in read-only mode. In this mode VictoriaLogs doesn't create lock files, "+
+		"doesn't create or remove directories, doesn't run background merges, retention, delete tasks or snapshot cleanup, and rejects data writes. "+
+		"This mode is useful for querying read-only backups")
 	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
 		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
 		"Bigger intervals may help increase the lifetime of flash storage with limited write cycles (e.g. Raspberry PI). "+
@@ -141,6 +144,7 @@ func initLocalStorage() {
 		LogNewStreams:          *logNewStreams,
 		LogIngestedRows:        *logIngestedRows,
 		MinFreeDiskSpaceBytes:  minFreeDiskSpaceBytes.N,
+		ReadOnly:               *storageReadOnly,
 	}
 	logger.Infof("opening storage at -storageDataPath=%s", *storageDataPath)
 	startTime := time.Now()
@@ -296,8 +300,11 @@ func processForceMerge(w http.ResponseWriter, r *http.Request) bool {
 		// Force merge isn't supported by non-local storage
 		return false
 	}
-
 	if !httpserver.CheckAuthFlag(w, r, forceMergeAuthKey) {
+		return true
+	}
+	if *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot force merge storage opened with -storage.readOnly")
 		return true
 	}
 
@@ -318,6 +325,10 @@ func processForceFlush(w http.ResponseWriter, r *http.Request) bool {
 	if !httpserver.CheckAuthFlag(w, r, forceFlushAuthKey) {
 		return true
 	}
+	if localStorage != nil && *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot force flush storage opened with -storage.readOnly")
+		return true
+	}
 
 	logger.Infof("flushing storage to make pending data available for reading")
 
@@ -335,8 +346,11 @@ func processPartitionAttach(w http.ResponseWriter, r *http.Request) bool {
 		// There are no partitions in non-local storage
 		return false
 	}
-
 	if !httpserver.CheckAuthFlag(w, r, partitionManageAuthKey) {
+		return true
+	}
+	if *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot attach partition when storage is opened with -storage.readOnly")
 		return true
 	}
 
@@ -354,8 +368,11 @@ func processPartitionDetach(w http.ResponseWriter, r *http.Request) bool {
 		// There are no partitions in non-local storage
 		return false
 	}
-
 	if !httpserver.CheckAuthFlag(w, r, partitionManageAuthKey) {
+		return true
+	}
+	if *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot detach partition when storage is opened with -storage.readOnly")
 		return true
 	}
 
@@ -393,8 +410,11 @@ func processPartitionSnapshotCreate(w http.ResponseWriter, r *http.Request) bool
 		// There are no partitions in non-local storage
 		return false
 	}
-
 	if !httpserver.CheckAuthFlag(w, r, partitionManageAuthKey) {
+		return true
+	}
+	if *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot create partition snapshot when storage is opened with -storage.readOnly")
 		return true
 	}
 
@@ -452,8 +472,11 @@ func processPartitionSnapshotDelete(w http.ResponseWriter, r *http.Request) bool
 		// There are no partitions in non-local storage
 		return false
 	}
-
 	if !httpserver.CheckAuthFlag(w, r, partitionManageAuthKey) {
+		return true
+	}
+	if *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot delete partition snapshot when storage is opened with -storage.readOnly")
 		return true
 	}
 
@@ -477,8 +500,11 @@ func processPartitionSnapshotDeleteStale(w http.ResponseWriter, r *http.Request)
 		// There are no partitions in non-local storage
 		return false
 	}
-
 	if !httpserver.CheckAuthFlag(w, r, partitionManageAuthKey) {
+		return true
+	}
+	if *storageReadOnly {
+		httpserver.Errorf(w, r, "cannot delete stale partition snapshots when storage is opened with -storage.readOnly")
 		return true
 	}
 
@@ -529,9 +555,13 @@ func (*Storage) CanWriteData() error {
 	}
 
 	if localStorage.IsReadOnly() {
+		reason := fmt.Sprintf("lack of free disk space at -storageDataPath=%s", *storageDataPath)
+		if *storageReadOnly {
+			reason = "-storage.readOnly is set"
+		}
 		return &httpserver.ErrorWithStatusCode{
 			Err: fmt.Errorf("cannot add rows into storage in read-only mode; the storage can be in read-only mode "+
-				"because of lack of free disk space at -storageDataPath=%s", *storageDataPath),
+				"because %s", reason),
 			StatusCode: http.StatusTooManyRequests,
 		}
 	}

@@ -92,6 +92,7 @@ type Table struct {
 
 	prepareBlock PrepareBlockCallback
 	isReadOnly   *atomic.Bool
+	readOnly     bool
 
 	// rawItems contains recently added items that haven't been converted to parts yet.
 	//
@@ -338,6 +339,7 @@ func (pw *partWrapper) decRef() {
 // The table is created if it doesn't exist yet.
 func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *atomic.Bool) *Table {
 	path = filepath.Clean(path)
+	readOnly := isReadOnly.Load()
 
 	if flushInterval < pendingItemsFlushInterval {
 		// There is no sense in setting flushInterval to values smaller than pendingItemsFlushInterval,
@@ -346,13 +348,20 @@ func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(
 	}
 
 	// Create a directory at the path if it doesn't exist yet.
-	fs.MustMkdirIfNotExist(path)
+	if !fs.IsPathExist(path) {
+		if readOnly {
+			logger.Panicf("FATAL: cannot open missing mergeset table path %q in read-only mode", path)
+		}
+		fs.MustMkdirIfNotExist(path)
+	}
 
 	// Open table parts.
-	pws := mustOpenParts(path)
+	pws := mustOpenParts(path, readOnly)
 
 	// Sync the path and the parent dir, so the path becomes visible in the parent dir.
-	fs.MustSyncPathAndParentDir(path)
+	if !readOnly {
+		fs.MustSyncPathAndParentDir(path)
+	}
 
 	tb := &Table{
 		path:                 path,
@@ -360,13 +369,16 @@ func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(
 		flushCallback:        flushCallback,
 		prepareBlock:         prepareBlock,
 		isReadOnly:           isReadOnly,
+		readOnly:             readOnly,
 		fileParts:            pws,
 		inmemoryPartsLimitCh: make(chan struct{}, maxInmemoryParts),
 		stopCh:               make(chan struct{}),
 	}
 	tb.mergeIdx.Store(uint64(time.Now().UnixNano()))
 	tb.rawItems.init()
-	tb.startBackgroundWorkers()
+	if !readOnly {
+		tb.startBackgroundWorkers()
+	}
 
 	return tb
 }
@@ -475,6 +487,24 @@ func getFilePartsConcurrency() int {
 // This func must be called only when there are no goroutines using the the
 // table, such as ones that ingest or retrieve index data.
 func (tb *Table) MustClose() {
+	if tb.readOnly {
+		// Do not flush or merge anything when opened in read-only mode.
+		close(tb.stopCh)
+
+		tb.partsLock.Lock()
+		fileParts := tb.fileParts
+		tb.fileParts = nil
+		tb.partsLock.Unlock()
+
+		for _, pw := range fileParts {
+			pw.decRef()
+			if refCount := pw.refCount.Load(); refCount != 0 {
+				logger.Panicf("BUG: unexpected non-zero partWrapper.refCount when closing read-only indexdb table: %d", refCount)
+			}
+		}
+		return
+	}
+
 	// Notify background workers to stop.
 	// The tb.partsLock is acquired in order to guarantee that tb.wg.Add() isn't called
 	// after tb.stopCh is closed and tb.wg.Wait() is called below.
@@ -646,6 +676,10 @@ func (tb *Table) UpdateMetrics(m *TableMetrics) {
 // The function ignores items with length exceeding maxInmemoryBlockSize.
 // It logs the ignored items, so users could notice and fix the issue.
 func (tb *Table) AddItems(items [][]byte) {
+	if tb.readOnly {
+		logger.Panicf("BUG: cannot add items to mergeset table %q opened in read-only mode", tb.path)
+	}
+
 	tb.rawItems.addItems(tb, items)
 	tb.itemsAdded.Add(uint64(len(items)))
 	n := 0
@@ -1464,14 +1498,19 @@ func (tb *Table) nextMergeIdx() uint64 {
 	return tb.mergeIdx.Add(1)
 }
 
-func mustOpenParts(path string) []*partWrapper {
+func mustOpenParts(path string, readOnly bool) []*partWrapper {
 	// Remove txn and tmp directories, which may be left after the upgrade
 	// to v1.90.0 and newer versions.
-	fs.MustRemoveDir(filepath.Join(path, "txn"))
-	fs.MustRemoveDir(filepath.Join(path, "tmp"))
+	if readOnly {
+		warnAboutDir(filepath.Join(path, "txn"), path)
+		warnAboutDir(filepath.Join(path, "tmp"), path)
+	} else {
+		fs.MustRemoveDir(filepath.Join(path, "txn"))
+		fs.MustRemoveDir(filepath.Join(path, "tmp"))
+	}
 
 	partsFile := filepath.Join(path, partsFilename)
-	partNames := mustReadPartNames(partsFile, path)
+	partNames := mustReadPartNames(partsFile, path, readOnly)
 
 	// Remove dirs missing in partNames. These dirs may be left after unclean shutdown
 	// or after the update from versions prior to v1.90.0.
@@ -1499,6 +1538,10 @@ func mustOpenParts(path string) []*partWrapper {
 		fn := de.Name()
 		if _, ok := m[fn]; !ok {
 			deletePath := filepath.Join(path, fn)
+			if readOnly {
+				logger.Warnf("leaving %q untouched in read-only mode because it isn't listed in %q", deletePath, partsFile)
+				continue
+			}
 			logger.Infof("deleting %q because it isn't listed in %q; this is the expected case after unclean shutdown", deletePath, partsFile)
 			fs.MustRemoveDir(deletePath)
 		}
@@ -1516,6 +1559,9 @@ func mustOpenParts(path string) []*partWrapper {
 		pws = append(pws, pw)
 	}
 	if !fs.IsPathExist(partsFile) {
+		if readOnly {
+			return pws
+		}
 		// Create parts.json file if it doesn't exist yet.
 		// This should protect from possible carshloops just after the migration from versions below v1.90.0
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4336
@@ -1523,6 +1569,12 @@ func mustOpenParts(path string) []*partWrapper {
 	}
 
 	return pws
+}
+
+func warnAboutDir(path, tablePath string) {
+	if fs.IsPathExist(path) {
+		logger.Warnf("leaving %q untouched in read-only mode while opening mergeset table %q", path, tablePath)
+	}
 }
 
 // MustCreateSnapshotAt creates tb snapshot in the given dstDir.
@@ -1593,7 +1645,7 @@ func mustWritePartNames(pws []*partWrapper, dstDir string) {
 	fs.MustWriteAtomic(partsFile, data, true)
 }
 
-func mustReadPartNames(partsFile, srcDir string) []string {
+func mustReadPartNames(partsFile, srcDir string, readOnly bool) []string {
 	if fs.IsPathExist(partsFile) {
 		data, err := os.ReadFile(partsFile)
 		if err != nil {
@@ -1604,6 +1656,9 @@ func mustReadPartNames(partsFile, srcDir string) []string {
 			logger.Panicf("FATAL: cannot parse %q: %s", partsFile, err)
 		}
 		return partNames
+	}
+	if readOnly {
+		logger.Warnf("missing %q while opening %q in read-only mode; using part directories without creating parts.json", partsFile, srcDir)
 	}
 	// The partsFilename is missing. This is the upgrade from versions previous to v1.90.0.
 	// Read part names from directories under srcDir

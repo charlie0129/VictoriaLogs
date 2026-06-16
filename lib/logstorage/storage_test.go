@@ -1,8 +1,11 @@
 package logstorage
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +25,98 @@ func TestStorageLifecycle(t *testing.T) {
 		s.MustClose()
 	}
 	fs.MustRemoveDir(path)
+}
+
+func TestStorageReadOnlyDoesNotWrite(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "storage")
+	cfg := &StorageConfig{
+		Retention:       365 * 24 * time.Hour,
+		FutureRetention: 365 * 24 * time.Hour,
+	}
+	s := MustOpenStorage(path, cfg)
+
+	lr := newTestLogRows(3, 10, 0)
+	for i := range lr.timestamps {
+		lr.timestamps[i] = time.Now().UTC().UnixNano()
+	}
+	expectedRowsCount := uint64(len(lr.timestamps))
+	s.MustAddRows(lr)
+	s.DebugFlush()
+	s.MustClose()
+
+	lockPath := filepath.Join(path, fs.FlockFilename)
+	if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("cannot remove lock file %q: %s", lockPath, err)
+	}
+
+	beforeHash := mustHashDir(t, path)
+
+	s = MustOpenStorage(path, &StorageConfig{ReadOnly: true})
+	if !s.IsReadOnly() {
+		t.Fatalf("storage opened with ReadOnly=true must report read-only mode")
+	}
+
+	var stats StorageStats
+	s.UpdateStats(&stats)
+	if rowsCount := stats.RowsCount(); rowsCount != expectedRowsCount {
+		t.Fatalf("unexpected rows count in read-only storage; got %d; want %d", rowsCount, expectedRowsCount)
+	}
+
+	if err := s.DeleteRunTask(nil, "task", time.Now().UTC().UnixNano(), nil, &Filter{}); err == nil {
+		t.Fatalf("DeleteRunTask must fail when storage is opened in read-only mode")
+	}
+	s.MustForceMerge("")
+	s.DebugFlush()
+	s.MustClose()
+
+	afterHash := mustHashDir(t, path)
+	if afterHash != beforeHash {
+		t.Fatalf("read-only storage open changed data tree; before hash %s; after hash %s", beforeHash, afterHash)
+	}
+	if fs.IsPathExist(lockPath) {
+		t.Fatalf("read-only storage open unexpectedly created lock file %q", lockPath)
+	}
+}
+
+func mustHashDir(t *testing.T, path string) string {
+	t.Helper()
+
+	var entries []string
+	if err := filepath.WalkDir(path, func(filePath string, de os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if filePath == path {
+			return nil
+		}
+		relPath, err := filepath.Rel(path, filePath)
+		if err != nil {
+			return err
+		}
+		if de.IsDir() {
+			entries = append(entries, "d "+relPath)
+			return nil
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+		dataHash := sha256.Sum256(data)
+		entries = append(entries, fmt.Sprintf("f %s %x", relPath, dataHash))
+		return nil
+	}); err != nil {
+		t.Fatalf("cannot hash directory %q: %s", path, err)
+	}
+
+	sort.Strings(entries)
+	h := sha256.New()
+	for _, entry := range entries {
+		_, _ = h.Write([]byte(entry))
+		_, _ = h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func TestStorageMustAddRows(t *testing.T) {

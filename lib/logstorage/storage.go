@@ -109,6 +109,12 @@ type StorageConfig struct {
 	//
 	// This can be useful for debugging of data ingestion.
 	LogIngestedRows bool
+
+	// ReadOnly opens the storage in read-only mode.
+	//
+	// In this mode the storage doesn't create lock files, doesn't create or remove directories,
+	// doesn't run background merges, retention, delete tasks or snapshot cleanup, and rejects writes.
+	ReadOnly bool
 }
 
 // Storage is the storage for log entries.
@@ -153,6 +159,9 @@ type Storage struct {
 
 	// minFreeDiskSpaceBytes is the minimum free disk space at path after which the storage stops accepting new data
 	minFreeDiskSpaceBytes uint64
+
+	// readOnly indicates whether the storage was opened in read-only mode.
+	readOnly bool
 
 	// logNewStreams instructs to log new streams if it is set to true
 	logNewStreams atomic.Bool
@@ -220,6 +229,10 @@ type Storage struct {
 //
 // The attached partition can be detached via PartitionDetach() call.
 func (s *Storage) PartitionAttach(name string) error {
+	if s.readOnly {
+		return fmt.Errorf("cannot attach partition %q when the storage is opened in read-only mode", name)
+	}
+
 	day, err := getPartitionDayFromName(name)
 	if err != nil {
 		return err
@@ -264,6 +277,10 @@ func (s *Storage) PartitionAttach(name string) error {
 //
 // The detached partition can be attached again via PartitionAttach() call.
 func (s *Storage) PartitionDetach(name string) error {
+	if s.readOnly {
+		return fmt.Errorf("cannot detach partition %q when the storage is opened in read-only mode", name)
+	}
+
 	ptw := func() *partitionWrapper {
 		s.partitionsLock.Lock()
 		defer s.partitionsLock.Unlock()
@@ -326,6 +343,10 @@ func (s *Storage) PartitionList() []string {
 //
 // The function returns paths to created snapshots
 func (s *Storage) PartitionSnapshotMustCreate(partitionPrefix string) []string {
+	if s.readOnly {
+		logger.Panicf("FATAL: cannot create partition snapshots when the storage is opened in read-only mode")
+	}
+
 	ptws := s.getPartitions()
 	defer s.putPartitions(ptws)
 
@@ -379,6 +400,10 @@ func getSnapshotPaths(ptws []*partitionWrapper) []string {
 
 // PartitionSnapshotDelete removes the snapshot located at the given snapshotPath if it belongs to an active partition.
 func (s *Storage) PartitionSnapshotDelete(snapshotPath string) error {
+	if s.readOnly {
+		return fmt.Errorf("cannot delete partition snapshot %q when the storage is opened in read-only mode", snapshotPath)
+	}
+
 	snapshotName := filepath.Base(snapshotPath)
 	if err := snapshotutil.Validate(snapshotName); err != nil {
 		return fmt.Errorf("unsupported snapshot name %q at %q: %w", snapshotName, snapshotPath, err)
@@ -413,6 +438,10 @@ func (s *Storage) PartitionSnapshotDelete(snapshotPath string) error {
 //
 // The list of paths to deleted snapshots is returned from this function.
 func (s *Storage) MustDeleteStalePartitionSnapshots(maxAge time.Duration) []string {
+	if s.readOnly {
+		return nil
+	}
+
 	var deletedSnapshotPaths []string
 
 	currentTime := time.Now()
@@ -445,6 +474,10 @@ func (s *Storage) MustDeleteStalePartitionSnapshots(maxAge time.Duration) []stri
 // The taskID must contain a unique id of the task. It is used for tracking the task at the list returned by DeleteActiveTasks().
 // The timestamp must contain the timestamp in seconds when the task is started.
 func (s *Storage) DeleteRunTask(_ context.Context, taskID string, timestamp int64, tenantIDs []TenantID, f *Filter) error {
+	if s.readOnly {
+		return fmt.Errorf("cannot create delete task when the storage is opened in read-only mode")
+	}
+
 	// Register the task in the list of active delete tasks, so it survives application restarts and crashes.
 	dt := newDeleteTask(taskID, timestamp, tenantIDs, f.String())
 
@@ -478,6 +511,10 @@ func (s *Storage) mustSaveDeleteTasksLocked() {
 // It waits until the task is stopped before returning.
 // If there is no a task with the given taskID, then the function returns immediately.
 func (s *Storage) DeleteStopTask(ctx context.Context, taskID string) error {
+	if s.readOnly {
+		return fmt.Errorf("cannot stop delete task when the storage is opened in read-only mode")
+	}
+
 	var doneCh <-chan struct{}
 
 	s.deleteTasksLock.Lock()
@@ -626,6 +663,7 @@ func mustCreateStorage(path string) {
 //
 // MustClose must be called on the returned Storage when it is no longer needed.
 func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
+	readOnly := cfg.ReadOnly
 	flushInterval := max(cfg.FlushInterval, time.Second)
 
 	retention := max(cfg.Retention, 24*time.Hour)
@@ -643,10 +681,18 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 	}
 
 	if !fs.IsPathExist(path) {
+		if readOnly {
+			logger.Panicf("FATAL: cannot open missing storage path %q in read-only mode", path)
+		}
 		mustCreateStorage(path)
 	}
 
-	flockF := fs.MustCreateFlockFile(path)
+	var flockF *os.File
+	if readOnly {
+		logger.Infof("opening storage at %q in read-only mode; lock file, background merges, retention and delete tasks are disabled", path)
+	} else {
+		flockF = fs.MustCreateFlockFile(path)
+	}
 
 	// Load caches
 	streamIDCache := newCache()
@@ -667,6 +713,7 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 		maxBackfillAge:         maxBackfillAge,
 		snapshotsMaxAge:        cfg.SnapshotsMaxAge,
 		minFreeDiskSpaceBytes:  minFreeDiskSpaceBytes,
+		readOnly:               readOnly,
 		logIngestedRows:        cfg.LogIngestedRows,
 		flockF:                 flockF,
 		stopCh:                 make(chan struct{}),
@@ -679,8 +726,15 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 	s.logNewStreams.Store(cfg.LogNewStreams)
 
 	partitionsPath := filepath.Join(path, partitionsDirname)
-	fs.MustMkdirIfNotExist(partitionsPath)
-	fs.MustSyncPath(path)
+	if !fs.IsPathExist(partitionsPath) {
+		if readOnly {
+			logger.Panicf("FATAL: cannot open storage in read-only mode, since partitions directory %q is missing", partitionsPath)
+		}
+		fs.MustMkdirIfNotExist(partitionsPath)
+	}
+	if !readOnly {
+		fs.MustSyncPath(path)
+	}
 
 	des := fs.MustReadDir(partitionsPath)
 	var partitionNames []string
@@ -694,6 +748,10 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 
 		partitionDir := filepath.Join(partitionsPath, fname)
 		if fs.IsPartiallyRemovedDir(partitionDir) {
+			if readOnly {
+				logger.Warnf("skipping partially removed partition directory %q in read-only mode", partitionDir)
+				continue
+			}
 			// Drop partially removed partition directory. This may happen when unclean shutdown happens during partition deletion.
 			fs.MustRemoveDir(partitionDir)
 			continue
@@ -725,31 +783,35 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 
 	sortPartitions(ptws)
 
-	// Delete partitions from the future if needed
-	now := time.Now().UnixNano()
-	maxAllowedDay := s.getMaxAllowedDay(now)
-	j := len(ptws) - 1
-	for j >= 0 {
-		ptw := ptws[j]
-		if ptw.day <= maxAllowedDay {
-			break
+	if !readOnly {
+		// Delete partitions from the future if needed
+		now := time.Now().UnixNano()
+		maxAllowedDay := s.getMaxAllowedDay(now)
+		j := len(ptws) - 1
+		for j >= 0 {
+			ptw := ptws[j]
+			if ptw.day <= maxAllowedDay {
+				break
+			}
+			logger.Infof("the partition %s is scheduled to be deleted because it is outside the -futureRetention=%dd", ptw.pt.path, durationToDays(s.futureRetention))
+			ptw.mustDrop.Store(true)
+			ptw.decRef()
+			j--
 		}
-		logger.Infof("the partition %s is scheduled to be deleted because it is outside the -futureRetention=%dd", ptw.pt.path, durationToDays(s.futureRetention))
-		ptw.mustDrop.Store(true)
-		ptw.decRef()
-		j--
+		j++
+		for i := j; i < len(ptws); i++ {
+			ptws[i] = nil
+		}
+		ptws = ptws[:j]
 	}
-	j++
-	for i := j; i < len(ptws); i++ {
-		ptws[i] = nil
-	}
-	ptws = ptws[:j]
 
 	s.partitions = ptws
-	s.runRetentionWatcher()
-	s.runMaxDiskSpaceUsageWatcher()
-	s.runDeleteTasksWatcher()
-	s.runSnapshotsMaxAgeWatcher()
+	if !readOnly {
+		s.runRetentionWatcher()
+		s.runMaxDiskSpaceUsageWatcher()
+		s.runDeleteTasksWatcher()
+		s.runSnapshotsMaxAgeWatcher()
+	}
 	return s
 }
 
@@ -1104,8 +1166,10 @@ func (s *Storage) MustClose() {
 	s.filterStreamCache = nil
 
 	// release lock file
-	fs.MustClose(s.flockF)
-	s.flockF = nil
+	if s.flockF != nil {
+		fs.MustClose(s.flockF)
+		s.flockF = nil
+	}
 
 	s.path = ""
 }
@@ -1114,6 +1178,11 @@ func (s *Storage) MustClose() {
 //
 // Partitions are merged sequentially in order to reduce load on the system.
 func (s *Storage) MustForceMerge(partitionPrefix string) {
+	if s.readOnly {
+		logger.Infof("skipping force merge for partition_prefix=%q because the storage is opened in read-only mode", partitionPrefix)
+		return
+	}
+
 	ptws := s.getPartitions()
 	defer s.putPartitions(ptws)
 
@@ -1140,6 +1209,10 @@ func (s *Storage) MustForceMerge(partitionPrefix string) {
 // The added rows become visible for search after small duration of time.
 // Call DebugFlush if the added rows must be queried immediately (for example, in tests).
 func (s *Storage) MustAddRows(lr *LogRows) {
+	if s.readOnly {
+		logger.Panicf("BUG: cannot add rows when the storage is opened in read-only mode")
+	}
+
 	// Fast path - try adding all the rows to the hot partition
 	s.partitionsLock.Lock()
 	ptwHot := s.ptwHot
@@ -1327,6 +1400,10 @@ func (s *Storage) UpdateStats(ss *StorageStats) {
 
 // IsReadOnly returns true if s is in read-only mode.
 func (s *Storage) IsReadOnly() bool {
+	if s.readOnly {
+		return true
+	}
+
 	available := fs.MustGetFreeSpace(s.path)
 	return available < s.minFreeDiskSpaceBytes
 }
@@ -1335,6 +1412,10 @@ func (s *Storage) IsReadOnly() bool {
 //
 // This function is for debugging and testing purposes only, since it is slow.
 func (s *Storage) DebugFlush() {
+	if s.readOnly {
+		return
+	}
+
 	ptws := s.getPartitions()
 	defer s.putPartitions(ptws)
 
